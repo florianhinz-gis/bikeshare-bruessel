@@ -224,17 +224,12 @@ alle_ergebnisse <- pmap(
 gesamt_df <- bind_rows(alle_ergebnisse)
 
 # -----------------------------------------------------------------------------
-# 6. An CSV-Datei anhaengen (Header nur beim ersten Mal, woechentliche
-#    Aufteilung). Es wird eine neue Datei pro ISO-Kalenderwoche (UTC) erzeugt,
-#    z.B. "bikeshare_log_bruessel_2026-W26.csv" fuer Kalenderwoche 26 2026.
-#    Da im Logging-Fenster (06:00-10:00 Uhr, ~16 Aufrufe/Tag) deutlich weniger
-#    Daten pro Tag anfallen als beim 24h-Betrieb, bleibt eine Wochendatei
-#    weiterhin klein genug fuer GitHub (Limit 100 MB/Datei).
+# 6. An CSV-Datei anhaengen (Header nur beim ersten Mal, taegliche Aufteilung).
+#    Es wird eine neue Datei pro Tag (UTC) erzeugt, z.B.
+#    "bikeshare_log_bruessel_2026-06-26.csv".
 # -----------------------------------------------------------------------------
-iso_jahr  <- format(Sys.time(), "%G", tz = "UTC")
-iso_woche <- format(Sys.time(), "%V", tz = "UTC")
-wochenstempel <- sprintf("%s-W%s", iso_jahr, iso_woche)
-ausgabe_datei <- sprintf("bikeshare_log_bruessel_%s.csv", wochenstempel)
+tagesstempel <- format(Sys.time(), "%Y-%m-%d", tz = "UTC")
+ausgabe_datei <- sprintf("bikeshare_log_bruessel_%s.csv", tagesstempel)
 
 if (nrow(gesamt_df) > 0) {
   write.table(
