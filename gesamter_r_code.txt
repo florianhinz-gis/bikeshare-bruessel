@@ -1,0 +1,1781 @@
+================================================================================
+DATEI: ./Ausfall Villo Stationen.R
+================================================================================
+
+# -----------------------------------------------------------------------------
+# Pakete
+# -----------------------------------------------------------------------------
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(lubridate)
+
+# -----------------------------------------------------------------------------
+# Daten laden
+# -----------------------------------------------------------------------------
+dateien <- list.files(pattern = "bikeshare_log_bruessel_\\d{4}-\\d{2}-\\d{2}\\.csv")
+
+alle_logs <- dateien %>%
+  lapply(\(f) read_csv(
+    f,
+    show_col_types = FALSE,
+    col_types = cols(.default = "c")
+  )) %>%
+  bind_rows() %>%
+  mutate(
+    num_bikes_available = as.integer(num_bikes_available),
+    num_docks_available = as.integer(num_docks_available),
+    lat = as.double(lat),
+    lon = as.double(lon),
+    timestamp = as.POSIXct(timestamp, tz = "UTC")
+  )
+
+# -----------------------------------------------------------------------------
+# Daten vorbereiten
+# -----------------------------------------------------------------------------
+villo_leer <- alle_logs %>%
+  filter(anbieter == "Villo (cyclocity/JCDecaux)") %>%
+  mutate(stunde = hour(with_tz(timestamp, "Europe/Brussels"))) %>%
+  filter(stunde %in% 6:9) %>%
+  group_by(station_id, name, stunde) %>%
+  summarise(
+    anteil_leer = mean(num_bikes_available == 0, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# -----------------------------------------------------------------------------
+# Plot
+# -----------------------------------------------------------------------------
+villo_leer %>%
+  filter(!is.na(name)) %>%
+  mutate(
+    kategorie = factor(
+      case_when(
+        anteil_leer == 0  ~ "Nie",
+        anteil_leer <= 10 ~ "Selten",
+        TRUE              ~ "Häufig"
+      ),
+      levels = c("Nie", "Selten", "Häufig")
+    )
+  ) %>%
+  count(stunde, kategorie) %>%
+  ggplot(aes(kategorie, n)) +
+  geom_col(width = 0.6, fill = "#F5C800") +
+  geom_text(aes(label = n), vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_y_continuous(
+    limits = c(0, 300),
+    expand = expansion(mult = c(0, 0.03))
+  ) +
+  facet_wrap(
+    ~stunde,
+    ncol = 4,
+    labeller = labeller(stunde = \(x) paste0(x, " Uhr"))
+  ) +
+  labs(
+    title = "Leerstände an Villo-Stationen",
+    subtitle = "Anteil der Messungen ohne verfügbare Mietfahrräder je Villo-Station und Uhrzeit\nKategorien: Nie = 0 %, Selten = >0-10 %, Häufig = >10 %",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title.position = "plot"
+  )
+
+
+
+
+================================================================================
+DATEI: ./Brüssel zuschneiden.R
+================================================================================
+
+# 1. Brüssel-Grenze laden
+bruessel_grenze <- gisco_get_nuts(
+  nuts_id    = "BE1",
+  resolution = "01",
+  year       = "2021"
+) %>%
+  st_transform(crs = 3035)
+
+# 2. Raster einlesen
+raster_belgien <- st_read("POP_GRID_2025_3035.shp")
+
+# 3. Auf Brüssel zuschneiden und leere Zellen entfernen
+raster_bruessel <- raster_belgien %>%
+  st_filter(bruessel_grenze, .predicate = st_intersects) %>%
+  filter(ms_pop > 0) %>%
+  select(ms_pop, geometry)
+
+# 4. Als GeoPackage speichern
+st_write(raster_bruessel,
+         "raster_bruessel_100m.gpkg",
+         delete_if_exists = TRUE)
+
+================================================================================
+DATEI: ./Entfernung zum Grand-Place.R
+================================================================================
+
+# -----------------------------------------------------------------------------
+# Pakete
+# -----------------------------------------------------------------------------
+library(sf)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(lubridate)
+
+# -----------------------------------------------------------------------------
+# Daten laden
+# -----------------------------------------------------------------------------
+ergebnisse <- read_csv("ergebnisse_gehzeiten.csv", show_col_types = FALSE)
+raster     <- st_read("raster_bruessel_100m.gpkg", quiet = TRUE)
+
+raster_punkte <- raster %>%
+  st_transform(crs = 4326) %>%
+  st_centroid() %>%
+  mutate(
+    from_id = as.character(row_number()),
+    lon     = st_coordinates(.)[, 1],
+    lat     = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(from_id, lon, lat, ms_pop)
+
+# -----------------------------------------------------------------------------
+# Distanz zum Grand-Place berechnen
+# -----------------------------------------------------------------------------
+zentrum <- st_sfc(
+  st_point(c(4.35247, 50.84673)),
+  crs = 4326
+)
+
+raster_distanz <- raster %>%
+  st_transform(3857) %>%
+  st_centroid() %>%
+  mutate(
+    from_id    = as.character(row_number()),
+    distanz_km = as.numeric(
+      st_distance(., st_transform(zentrum, 3857))
+    ) / 1000
+  ) %>%
+  st_drop_geometry() %>%
+  select(from_id, distanz_km)
+
+# -----------------------------------------------------------------------------
+# Median Gehzeit pro Zelle
+# -----------------------------------------------------------------------------
+gehzeit_daten <- ergebnisse %>%
+  filter(stunde == 7) %>%
+  mutate(anbieter = recode(anbieter, "Villo (cyclocity/JCDecaux)" = "Villo")) %>%
+  mutate(from_id = as.character(from_id)) %>%
+  left_join(raster_punkte %>% select(from_id, ms_pop), by = "from_id") %>%
+  filter(!is.na(ms_pop)) %>%
+  group_by(from_id, anbieter) %>%
+  summarise(
+    median_gehzeit = median(min_gehzeit, na.rm = TRUE),
+    ms_pop         = first(ms_pop),
+    .groups        = "drop"
+  )
+
+# -----------------------------------------------------------------------------
+# Fehlende Villo-Zellen mit 15 Min ergänzen
+# -----------------------------------------------------------------------------
+fehlende_zellen <- raster_punkte %>%
+  mutate(from_id = as.character(from_id)) %>%
+  anti_join(
+    ergebnisse %>%
+      filter(grepl("Villo", anbieter)) %>%
+      mutate(from_id = as.character(from_id)) %>%
+      distinct(from_id),
+    by = "from_id"
+  ) %>%
+  mutate(
+    anbieter       = "Villo",
+    median_gehzeit = 15
+  ) %>%
+  select(from_id, anbieter, median_gehzeit, lon, lat, ms_pop)
+
+gehzeit_daten_korrigiert <- bind_rows(gehzeit_daten, fehlende_zellen)
+
+# -----------------------------------------------------------------------------
+# Distanz verknüpfen und Plot-Daten berechnen
+# -----------------------------------------------------------------------------
+plot_daten <- gehzeit_daten_korrigiert %>%
+  left_join(raster_distanz, by = "from_id") %>%
+  filter(distanz_km < 14) %>%
+  mutate(
+    distanzklasse = cut(
+      distanz_km,
+      breaks = seq(0, 14, by = 2),
+      include.lowest = TRUE,
+      labels = c("0–2", "2–4", "4–6", "6–8", "8–10", "10–12", "12–14")
+    )
+  ) %>%
+  group_by(anbieter, distanzklasse) %>%
+  summarise(
+    median_gehzeit = weighted.mean(median_gehzeit, ms_pop),
+    .groups        = "drop"
+  )
+
+# -----------------------------------------------------------------------------
+# Plot
+# -----------------------------------------------------------------------------
+ggplot(
+  plot_daten,
+  aes(
+    x     = distanzklasse,
+    y     = median_gehzeit,
+    group = anbieter,
+    color = anbieter
+  )
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(
+    values = c(
+      "Bolt"  = "#34D186",
+      "Dott"  = "#00C2E8",
+      "Villo" = "#F5C800"
+    ),
+    breaks = c("Bolt", "Dott", "Villo")
+  ) +
+  scale_y_continuous(
+    limits = c(0, 14),
+    breaks = c(0, 2, 4, 6, 8, 10, 12, 14),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title    = "Erreichbarkeit des nächsten Mietfahrrads\nnach Entfernung vom Grand-Place (7 Uhr)",
+    subtitle = "Bevölkerungsgewichteter Mittelwert der medianen Gehzeit\nje 2-km-Distanzklasse",
+    x        = "Entfernung vom Stadtzentrum (km)",
+    y        = "Mittlere Gehzeit (min)",
+    color    = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title.position  = "plot",
+    legend.position      = "top",
+    panel.grid.major.x   = element_blank(),
+    panel.grid.minor.x   = element_blank(),
+    panel.grid.minor.y   = element_line(colour = "grey90"),
+    plot.margin          = margin(10, 10, 5, 10)
+  )
+
+
+
+
+================================================================================
+DATEI: ./Erreichbarkeiten 5 min.R
+================================================================================
+
+# -----------------------------------------------------------------------------
+# Pakete
+# -----------------------------------------------------------------------------
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(sf)
+
+# -----------------------------------------------------------------------------
+# Daten laden
+# -----------------------------------------------------------------------------
+ergebnisse <- read_csv("ergebnisse_gehzeiten.csv", show_col_types = FALSE)
+
+raster <- st_read("raster_bruessel_100m.gpkg", quiet = TRUE)
+
+raster_punkte <- raster %>%
+  st_transform(crs = 4326) %>%
+  st_centroid() %>%
+  mutate(
+    from_id = as.character(row_number()),
+    lon     = st_coordinates(.)[, 1],
+    lat     = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(from_id, lon, lat, ms_pop)
+
+bev_gesamt <- 1274187
+
+farben_anbieter <- c(
+  "Bolt"  = "#34D186",
+  "Dott"  = "#00C2E8",
+  "Villo" = "#F5C800"
+)
+
+# -----------------------------------------------------------------------------
+# Erreichbarkeit unter 5 Minuten
+# -----------------------------------------------------------------------------
+erreichbarkeit_5min <- ergebnisse %>%
+  mutate(anbieter = recode(anbieter, "Villo (cyclocity/JCDecaux)" = "Villo")) %>%
+  mutate(from_id = as.character(from_id)) %>%
+  left_join(raster_punkte %>% select(from_id, ms_pop), by = "from_id") %>%
+  filter(min_gehzeit <= 5) %>%
+  group_by(anbieter, stunde, datum) %>%
+  summarise(bev_erreicht = sum(ms_pop, na.rm = TRUE), .groups = "drop") %>%
+  group_by(anbieter, stunde) %>%
+  summarise(anteil = median(bev_erreicht / bev_gesamt * 100), .groups = "drop")
+
+# Villo-Wert für Annotation
+villo_anteil <- erreichbarkeit_5min %>%
+  filter(anbieter == "Villo") %>%
+  summarise(anteil = round(mean(anteil), 0)) %>%
+  pull(anteil)
+
+# Y-Achsen-Bereich nur für Bolt und Dott
+bolt_dott_min <- erreichbarkeit_5min %>%
+  filter(anbieter %in% c("Bolt", "Dott")) %>%
+  pull(anteil) %>%
+  min() %>%
+  floor() - 1
+
+bolt_dott_max <- erreichbarkeit_5min %>%
+  filter(anbieter %in% c("Bolt", "Dott")) %>%
+  pull(anteil) %>%
+  max() %>%
+  ceiling() + 1
+
+# Plot
+ggplot(
+  erreichbarkeit_5min %>% filter(anbieter %in% c("Bolt", "Dott")),
+  aes(x = stunde, y = anteil, color = anbieter)
+) +
+  annotate(
+    "text",
+    x = 6, y = bolt_dott_min + 0.3,
+    label = paste0("Villo: konstant ", villo_anteil, "%"),
+    color = "#F5C800",
+    hjust = 0,
+    size  = 3.5,
+    fontface = "bold"
+  ) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = farben_anbieter, name = NULL) +
+  scale_x_continuous(
+    breaks = c(6, 7, 8, 9),
+    labels = c("6 Uhr", "7 Uhr", "8 Uhr", "9 Uhr")
+  ) +
+  scale_y_continuous(
+    limits = c(bolt_dott_min, bolt_dott_max),
+    labels = function(x) paste0(x, "%")
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position  = "top"
+  ) +
+  labs(
+    title    = "Bevölkerungsanteil mit Zugang zum nächsten Mietfahrrad\nin unter 5 Gehminuten",
+    subtitle = "Median über 24 Tage nach Anbieter und Uhrzeit",
+    x = NULL,
+    y = NULL
+  )
+
+
+================================================================================
+DATEI: ./Schwankung Gehzeit.R
+================================================================================
+
+# -----------------------------------------------------------------------------
+# Pakete
+# -----------------------------------------------------------------------------
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(Hmisc)
+library(sf)
+
+# -----------------------------------------------------------------------------
+# Daten laden
+# -----------------------------------------------------------------------------
+ergebnisse <- read_csv("ergebnisse_gehzeiten.csv", show_col_types = FALSE)
+
+raster <- st_read("raster_bruessel_100m.gpkg", quiet = TRUE)
+
+raster_punkte <- raster %>%
+  st_transform(crs = 4326) %>%
+  st_centroid() %>%
+  mutate(
+    from_id = as.character(row_number()),
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(from_id, ms_pop)
+
+# -----------------------------------------------------------------------------
+# IQR je Rasterzelle berechnen
+# -----------------------------------------------------------------------------
+iqr_daten <- ergebnisse %>%
+  filter(stunde == 7) %>%
+  mutate(
+    anbieter = recode(
+      anbieter,
+      "Villo (cyclocity/JCDecaux)" = "Villo"
+    ),
+    from_id = as.character(from_id)
+  ) %>%
+  group_by(from_id, anbieter) %>%
+  summarise(
+    iqr_gehzeit = IQR(min_gehzeit, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(raster_punkte, by = "from_id") %>%
+  filter(!is.na(ms_pop))
+
+# -----------------------------------------------------------------------------
+# Bevölkerungsgewichtete Zusammenfassung
+# -----------------------------------------------------------------------------
+iqr_zusammenfassung <- iqr_daten %>%
+  group_by(anbieter) %>%
+  summarise(
+    median = as.numeric(
+      Hmisc::wtd.quantile(
+        iqr_gehzeit,
+        weights = ms_pop,
+        probs = 0.50
+      )
+    ),
+    p25 = as.numeric(
+      Hmisc::wtd.quantile(
+        iqr_gehzeit,
+        weights = ms_pop,
+        probs = 0.25
+      )
+    ),
+    p75 = as.numeric(
+      Hmisc::wtd.quantile(
+        iqr_gehzeit,
+        weights = ms_pop,
+        probs = 0.75
+      )
+    ),
+    .groups = "drop"
+  )
+
+# -----------------------------------------------------------------------------
+# Plot
+# -----------------------------------------------------------------------------
+ggplot(
+  iqr_zusammenfassung,
+  aes(
+    y = factor(anbieter, levels = c("Villo", "Dott", "Bolt")),
+    x = median,
+    color = anbieter
+  )
+) +
+  geom_pointrange(
+    aes(xmin = p25, xmax = p75),
+    linewidth = 1.2,
+    size = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "Bolt" = "#34D186",
+      "Dott" = "#00C2E8",
+      "Villo" = "#F5C800"
+    ),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 2, 0.5),
+    limits = c(0, 2)
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(
+      color = c("#F5C800", "#00C2E8", "#34D186"),
+      face = "bold",
+      size = 11
+    ),
+    plot.title.position = "plot"
+  ) +
+  labs(
+    title = "Tägliche Variabilität der Gehzeit zum nächstgelegenen Mietfahrrad",
+    subtitle = "Interquartilsabstand (IQR) der täglichen Gehzeit über \n24 Erhebungstage (jeweils 7 Uhr) · Bevölkerungsgewichtet\nPunkt = Median · Balken = 25.–75. Perzentil",
+    x = "Interquartilsabstand der Gehzeit (Minuten)"
+  )
+
+
+================================================================================
+DATEI: ./Top Villo Stationen.R
+================================================================================
+
+# -----------------------------------------------------------------------------
+# Pakete
+# -----------------------------------------------------------------------------
+library(dplyr)
+library(readr)
+library(lubridate)
+library(stringr)
+
+# -----------------------------------------------------------------------------
+# Alle Tagesdateien einlesen
+# -----------------------------------------------------------------------------
+dateien <- list.files(pattern = "bikeshare_log_bruessel_\\d{4}-\\d{2}-\\d{2}\\.csv")
+
+alle_logs <- dateien %>%
+  lapply(function(f) read_csv(f, show_col_types = FALSE, col_types = cols(.default = "c"))) %>%
+  bind_rows() %>%
+  mutate(
+    num_bikes_available  = as.integer(num_bikes_available),
+    num_docks_available  = as.integer(num_docks_available),
+    lat                  = as.double(lat),
+    lon                  = as.double(lon),
+    timestamp            = as.POSIXct(timestamp, tz = "UTC")
+  )
+
+names(alle_logs)
+nrow(alle_logs)
+
+# -----------------------------------------------------------------------------
+# Nur Villo, nur Morgenstunden 6-9 Uhr
+# -----------------------------------------------------------------------------
+villo_morgen <- alle_logs %>%
+  filter(anbieter == "Villo (cyclocity/JCDecaux)") %>%
+  mutate(
+    timestamp = as.POSIXct(timestamp, tz = "UTC"),
+    stunde    = hour(with_tz(timestamp, "Europe/Brussels"))
+  ) %>%
+  filter(stunde %in% c(6, 7, 8, 9))
+
+# -----------------------------------------------------------------------------
+# Durchschnittliche Anzahl Fahrräder pro Station
+# -----------------------------------------------------------------------------
+villo_stationen <- villo_morgen %>%
+  group_by(station_id, name, stunde) %>%
+  summarise(
+    durchschnitt_raeder = mean(num_bikes_available, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(stunde, desc(durchschnitt_raeder))
+
+# Top 10 pro Stunde
+villo_stationen %>%
+  group_by(stunde) %>%
+  slice_max(durchschnitt_raeder, n = 10)
+
+unique(alle_logs$anbieter)
+
+
+villo_stationen %>%
+  filter(stunde == 7) %>%
+  slice_max(durchschnitt_raeder, n = 10) %>%
+  mutate(name = str_to_title(tolower(name))) %>%
+  ggplot(aes(x = reorder(name, durchschnitt_raeder), y = durchschnitt_raeder)) +
+  geom_col(fill = "#F5C800") +
+  geom_text(aes(label = round(durchschnitt_raeder, 1)), 
+            hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 28)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    axis.title         = element_blank(),
+    plot.title.position = "plot",
+    plot.title         = element_text(hjust = 0),
+    plot.subtitle      = element_text(hjust = 0)
+  ) +
+  labs(
+    title    = "Top 10 Villo-Stationen: Verfügbare Räder um 7 Uhr",
+    subtitle = "Durchschnitt über 24 Tage"
+  )
+
+
+================================================================================
+DATEI: ./Ungleichverteilung.R
+================================================================================
+
+# -----------------------------------------------------------------------------
+# Pakete
+# -----------------------------------------------------------------------------
+library(sf)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(ggtext)
+library(osmdata)
+library(giscoR)
+library(scales)
+
+# -----------------------------------------------------------------------------
+# Daten laden
+# -----------------------------------------------------------------------------
+ergebnisse <- read_csv("ergebnisse_gehzeiten.csv", show_col_types = FALSE)
+
+raster <- st_read("raster_bruessel_100m.gpkg", quiet = TRUE)
+
+# -----------------------------------------------------------------------------
+# Rasterpunkte mit Koordinaten
+# -----------------------------------------------------------------------------
+raster_punkte <- raster %>%
+  st_transform(crs = 4326) %>%
+  st_centroid() %>%
+  mutate(
+    from_id = as.character(row_number()),
+    lon     = st_coordinates(.)[, 1],
+    lat     = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(from_id, lon, lat, ms_pop)
+
+# -----------------------------------------------------------------------------
+# Rasterpunkte als sf für Spatial Join
+# -----------------------------------------------------------------------------
+raster_sf <- raster_punkte %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# -----------------------------------------------------------------------------
+# Stadtteile von OSM laden (admin_level 8)
+# -----------------------------------------------------------------------------
+stadtteile <- opq(bbox = c(4.22, 50.77, 4.50, 50.93)) %>%
+  add_osm_feature(key = "admin_level", value = "8") %>%
+  osmdata_sf()
+
+stadtteile_sf <- stadtteile$osm_multipolygons %>%
+  st_transform(crs = 4326) %>%
+  select(name, geometry)
+
+# -----------------------------------------------------------------------------
+# Nur die 19 Gemeinden der Hauptstadtregion Brüssel
+# -----------------------------------------------------------------------------
+gemeinden_bruessel <- c(
+  "Anderlecht", "Auderghem - Oudergem",
+  "Berchem-Sainte-Agathe - Sint-Agatha-Berchem",
+  "Bruxelles - Brussel", "Etterbeek", "Evere",
+  "Forest - Vorst", "Ganshoren", "Ixelles - Elsene",
+  "Jette", "Koekelberg",
+  "Molenbeek-Saint-Jean - Sint-Jans-Molenbeek",
+  "Saint-Gilles - Sint-Gillis",
+  "Saint-Josse-ten-Noode - Sint-Joost-ten-Node",
+  "Schaerbeek - Schaarbeek", "Uccle - Ukkel",
+  "Watermael-Boitsfort - Watermaal-Bosvoorde",
+  "Woluwe-Saint-Lambert - Sint-Lambrechts-Woluwe",
+  "Woluwe-Saint-Pierre - Sint-Pieters-Woluwe"
+)
+
+stadtteile_bruessel <- stadtteile_sf %>%
+  filter(name %in% gemeinden_bruessel)
+
+# -----------------------------------------------------------------------------
+# Spatial Join: Rasterzellen → Stadtteile
+# -----------------------------------------------------------------------------
+raster_stadtteile <- st_join(raster_sf, stadtteile_sf)
+
+# -----------------------------------------------------------------------------
+# Median pro Zelle und Anbieter bei Stunde 7
+# -----------------------------------------------------------------------------
+alle_daten <- ergebnisse %>%
+  filter(stunde == 7) %>%
+  group_by(from_id, anbieter) %>%
+  summarise(median_gehzeit = median(min_gehzeit, na.rm = TRUE), .groups = "drop") %>%
+  mutate(from_id = as.character(from_id)) %>%
+  left_join(raster_punkte, by = "from_id") %>%
+  filter(!is.na(lon))
+
+# -----------------------------------------------------------------------------
+# Bevölkerungsgewichtete mittlere Gehzeit pro Stadtteil und Anbieter
+# -----------------------------------------------------------------------------
+stadtteil_abs <- alle_daten %>%
+  mutate(from_id = as.character(from_id)) %>%
+  left_join(
+    raster_stadtteile %>% st_drop_geometry() %>% select(from_id, name),
+    by = "from_id"
+  ) %>%
+  filter(!is.na(name)) %>%
+  group_by(anbieter, name) %>%
+  summarise(
+    gew_gehzeit = weighted.mean(median_gehzeit, w = ms_pop, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(anbieter = recode(anbieter,
+                           "Villo (cyclocity/JCDecaux)" = "Villo"
+  ))
+
+# -----------------------------------------------------------------------------
+# Fehlende Villo-Gemeinden auf 15 Min setzen (weil r5r nur bis 15 min berechnet wurde)
+# -----------------------------------------------------------------------------
+fehlende_villo <- setdiff(
+  gemeinden_bruessel,
+  stadtteil_abs %>% filter(anbieter == "Villo") %>% pull(name)
+)
+
+stadtteil_abs_neu <- bind_rows(
+  stadtteil_abs,
+  tibble(
+    anbieter    = "Villo",
+    name        = fehlende_villo,
+    gew_gehzeit = 15
+  )
+)
+
+# -----------------------------------------------------------------------------
+# Geodaten für Plot zusammenführen
+# -----------------------------------------------------------------------------
+stadtteile_abs_geo <- stadtteile_bruessel %>%
+  select(name, geometry) %>%
+  left_join(stadtteil_abs_neu, by = "name")
+
+# -----------------------------------------------------------------------------
+# Plot
+# -----------------------------------------------------------------------------
+stadtteile_abs_geo %>%
+  filter(anbieter %in% c("Bolt", "Dott", "Villo")) %>%
+  filter(!is.na(gew_gehzeit)) %>%
+  mutate(anbieter = factor(anbieter, levels = c("Bolt", "Dott", "Villo"))) %>%
+  ggplot() +
+  geom_sf(aes(fill = gew_gehzeit), color = "white", linewidth = 0.3) +
+  scale_fill_gradientn(
+    colours  = c("#1a9641", "#a6d96a", "#ffffbf", "#fee08b", "#fdae61", "#f46d43", "#d73027", "#a50026"),
+    values   = scales::rescale(c(0, 2, 4, 6, 8, 10, 12, 15)),
+    limits   = c(0, 15),
+    breaks   = c(0, 3, 6, 9, 12, 15),
+    na.value = "#eeeeee",
+    name     = "Gehzeit\n(Minuten)"
+  ) +
+  facet_wrap(~anbieter, ncol = 3,
+             labeller = as_labeller(c(
+               "Bolt"  = "<span style='color:#34D186'>Bolt</span>",
+               "Dott"  = "<span style='color:#00C2E8'>Dott</span>",
+               "Villo" = "<span style='color:#F5C800'>Villo</span>"
+             ))
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text  = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    strip.text = ggtext::element_markdown(size = 11, face = "bold")
+  ) +
+  labs(title = "Bevölkerungsgewichtete mittlere Gehzeit zum nächsten Mietfahrrad\n19 Gemeinden der Hauptstadtregion Brüssel — 7 Uhr")
+
+
+================================================================================
+DATEI: ./Verteilung der Gehzeiten.R
+================================================================================
+
+# -----------------------------------------------------------------------------
+# Pakete
+# -----------------------------------------------------------------------------
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(ggridges)
+library(sf)
+
+# -----------------------------------------------------------------------------
+# Daten laden
+# -----------------------------------------------------------------------------
+ergebnisse <- read_csv("ergebnisse_gehzeiten.csv", show_col_types = FALSE)
+
+raster <- st_read("raster_bruessel_100m.gpkg", quiet = TRUE)
+
+raster_punkte <- raster %>%
+  st_transform(crs = 4326) %>%
+  st_centroid() %>%
+  mutate(
+    from_id = as.character(row_number()),
+    lon     = st_coordinates(.)[, 1],
+    lat     = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(from_id, lon, lat, ms_pop)
+
+# -----------------------------------------------------------------------------
+# Daten vorbereiten
+# -----------------------------------------------------------------------------
+gehzeit_daten <- ergebnisse %>%
+  filter(stunde == 7) %>%
+  mutate(anbieter = recode(anbieter, "Villo (cyclocity/JCDecaux)" = "Villo")) %>%
+  mutate(from_id = as.character(from_id)) %>%
+  left_join(raster_punkte %>% select(from_id, ms_pop), by = "from_id") %>%
+  filter(!is.na(ms_pop)) %>%
+  group_by(from_id, anbieter) %>%
+  summarise(
+    median_gehzeit = median(min_gehzeit, na.rm = TRUE),
+    ms_pop         = first(ms_pop),
+    .groups        = "drop"
+  )
+
+# -----------------------------------------------------------------------------
+# Ridgeline Plot
+# -----------------------------------------------------------------------------
+ggplot(gehzeit_daten, 
+       aes(x = median_gehzeit, y = anbieter, 
+           fill = anbieter, weight = ms_pop)) +
+  geom_density_ridges(alpha = 0.8, scale = 1.5, bandwidth = 0.5) +
+  scale_fill_manual(values = c(
+    "Bolt"  = "#34D186",
+    "Dott"  = "#00C2E8",
+    "Villo" = "#F5C800"
+  ), guide = "none") +
+  scale_y_discrete(limits = c("Villo", "Dott", "Bolt")) +
+  scale_x_continuous(limits = c(0, 15), breaks = c(0, 5, 10, 15)) +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y  = element_blank(),
+    axis.title.y        = element_blank(),
+    axis.text.y         = element_text(color = c("#F5C800", "#00C2E8", "#34D186"),
+                                       face = "bold", size = 11),
+    axis.ticks.y        = element_blank(),
+    plot.title.position = "plot"
+  ) +
+  labs(
+    title    = "Verteilung der Gehzeiten zum nächsten Mietfahrrad",
+    subtitle = "Bevölkerungsgewichtet · Median über 24 Tage (jeweils um 7 Uhr)",
+    x        = "Gehzeit (Minuten)",
+    y        = NULL
+  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+================================================================================
+DATEI: ./app.R
+================================================================================
+
+library(shiny)
+library(leaflet)
+library(dplyr)
+library(readr)
+library(htmltools)
+library(ggplot2)
+library(base64enc)
+library(sf)
+
+# -----------------------------------------------------------------------------
+# Daten laden
+# -----------------------------------------------------------------------------
+aggregiert <- read_csv("aggregiert_rasterzellen.csv",
+                       show_col_types = FALSE) %>%
+  mutate(from_id = as.character(from_id))
+
+kennzahlen <- read_csv("aggregiert_kennzahlen.csv",
+                       show_col_types = FALSE)
+
+ergebnisse <- readRDS("ergebnisse_gehzeiten.rds")
+
+fahrzeuge <- readRDS("fahrzeuge_karte_xz.rds")
+raster_zentroide <- readRDS("raster_zentroide.rds")
+
+# Vorberechnete Geo-Daten laden
+anbieter_keys <- list(
+  "Villo (cyclocity/JCDecaux)" = "Villo__cyclocity_JCDecaux_",
+  "Dott"                       = "Dott",
+  "Bolt"                       = "Bolt",
+  "Kombiniert"                 = "Kombiniert"
+)
+
+geo_cache <- list()
+for (anb in names(anbieter_keys)) {
+  key <- anbieter_keys[[anb]]
+  for (std in c(6, 7, 8, 9)) {
+    dateiname <- sprintf("geo_%s_%d.rds", key, std)
+    cache_key <- paste0(anb, "_", std)
+    if (file.exists(dateiname)) {
+      geo_cache[[cache_key]] <- readRDS(dateiname)
+    }
+  }
+}
+
+message("Daten geladen")
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktionen
+# -----------------------------------------------------------------------------
+anbieter_farben <- c(
+  "Villo" = "#F5C800",
+  "Dott"  = "#00C2E8",
+  "Bolt"  = "#34D186"
+)
+
+radius_grad <- 400 / 111320
+
+alle_tage    <- sort(unique(as.Date(fahrzeuge$datum)))
+tage_labels  <- format(alle_tage, "%d.%m.%Y")
+tage_choices <- setNames(as.character(alle_tage), tage_labels)
+
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      .irs-grid-text { font-size: 13px; font-weight: bold; }
+      .irs-min, .irs-max { display: none; }
+      input[value='Villo (cyclocity/JCDecaux)'] + span { color: #F5C800; font-weight: bold; }
+      input[value='Dott'] + span { color: #00C2E8; font-weight: bold; }
+      input[value='Bolt'] + span { color: #34D186; font-weight: bold; }
+      input[value='Kombiniert'] + span { color: #666666; font-weight: bold; }
+    "))
+  ),
+  
+  titlePanel("Erreichbarkeit von Mietfahrrädern am Brüsseler Morgen"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      
+      h5("Anbieter"),
+      radioButtons(
+        inputId  = "anbieter",
+        label    = NULL,
+        choices  = c(
+          "Villo"      = "Villo (cyclocity/JCDecaux)",
+          "Dott"       = "Dott",
+          "Bolt"       = "Bolt",
+          "Kombiniert" = "Kombiniert"
+        ),
+        selected = "Kombiniert"
+      ),
+      
+      hr(),
+      
+      h5("Uhrzeit"),
+      sliderInput(
+        inputId  = "stunde",
+        label    = NULL,
+        min = 6, max = 9, value = 7, step = 1,
+        ticks = FALSE, sep = "", post = " Uhr"
+      ),
+      
+      hr(),
+      
+      conditionalPanel(
+        condition = "!output.detail_aktiv",
+        
+        h5("Bevölkerungsanteil mit Zugang zum nächsten Mietrad in...",
+           style = "margin-bottom:10px;"),
+        tags$table(style = "width:100%; font-size:12px;",
+                   tags$tr(
+                     tags$td(style = "color:#666; padding-bottom:4px;", "< 1 Gehminute"),
+                     tags$td(style = "text-align:right;",
+                             h4(textOutput("kennzahl_1min"), style = "color:#2196F3; margin:0;"))
+                   ),
+                   tags$tr(
+                     tags$td(style = "color:#666; padding-bottom:4px;", "< 2 Gehminuten"),
+                     tags$td(style = "text-align:right;",
+                             h4(textOutput("kennzahl_2min"), style = "color:#2196F3; margin:0;"))
+                   ),
+                   tags$tr(
+                     tags$td(style = "color:#666;", "< 5 Gehminuten"),
+                     tags$td(style = "text-align:right;",
+                             h4(textOutput("kennzahl_5min"), style = "color:#2196F3; margin:0;"))
+                   )
+        ),
+        
+        hr(),
+        
+        h6("mediane Gehzeit zum nächsten Mietrad"),
+        tags$table(style = "font-size:11px; width:100%;",
+                   tags$tr(
+                     tags$td(style = "background:#1a9641; width:16px; height:12px;"),
+                     tags$td(style = "padding-left:6px;", "0–2 Minuten")
+                   ),
+                   tags$tr(
+                     tags$td(style = "background:#a6d96a; width:16px; height:12px;"),
+                     tags$td(style = "padding-left:6px;", "2–5 Minuten")
+                   ),
+                   tags$tr(
+                     tags$td(style = "background:#ffffbf; width:16px; height:12px;"),
+                     tags$td(style = "padding-left:6px;", "5–10 Minuten")
+                   ),
+                   tags$tr(
+                     tags$td(style = "background:#fdae61; width:16px; height:12px;"),
+                     tags$td(style = "padding-left:6px;", "10–15 Minuten")
+                   ),
+                   tags$tr(
+                     tags$td(style = "background:#d7191c; width:16px; height:12px;"),
+                     tags$td(style = "padding-left:6px;", "> 15 Minuten")
+                   )
+        ),
+        
+        hr(),
+        
+        p("Auf eine Rasterzelle klicken für Tagesverlauf",
+          style = "font-size:11px; color:#2196F3; font-style:italic;"),
+        
+        hr(),
+        
+        p("Quelle: GBFS-Feeds Villo, Dott, Bolt | Statbel Bevölkerungsraster | OpenStreetMap-Wegenetz",
+          style = "font-size:10px; color:#999;")
+      ),
+      
+      conditionalPanel(
+        condition = "output.detail_aktiv",
+        
+        h5("Tag auswählen"),
+        selectInput(
+          inputId  = "datum_gewaehlt",
+          label    = NULL,
+          choices  = tage_choices,
+          selected = as.character(max(alle_tage))
+        ),
+        div(style = "display: flex; gap: 6px;",
+            actionButton("play_btn", "▶ Abspielen",
+                         class = "btn-default btn-sm", style = "flex: 1;"),
+            actionButton("stop_btn", "■ Stop",
+                         class = "btn-default btn-sm", style = "flex: 1;")
+        ),
+        p("Zeigt verfügbare Mieträder in der Nähe",
+          style = "font-size:11px; color:#999; margin-top:6px;"),
+        p("Die Darstellung basiert auf Luftliniendistanz (400m-Radius). Gehzeiten im Tagesverlauf werden auf dem realen Straßennetz berechnet und können abweichen.",
+          style = "font-size:10px; color:#999; margin-top:4px;"),
+        actionButton("zurueck", "← Zurück zur Übersicht",
+                     class = "btn-sm btn-default",
+                     style = "margin-top:6px; width:100%;"),
+        
+        hr(),
+        
+        p("Quelle: GBFS-Feeds Villo, Dott, Bolt | Statbel Bevölkerungsraster | OpenStreetMap-Wegenetz",
+          style = "font-size:10px; color:#999;")
+      )
+    ),
+    
+    mainPanel(
+      leafletOutput("karte", height = "85vh")
+    )
+  )
+)
+
+# -----------------------------------------------------------------------------
+# Server
+# -----------------------------------------------------------------------------
+server <- function(input, output, session) {
+  
+  aktive_zelle <- reactiveVal(NULL)
+  detail_aktiv <- reactiveVal(FALSE)
+  play_aktiv   <- reactiveVal(FALSE)
+  play_index   <- reactiveVal(1)
+  datum_aktiv  <- reactiveVal(as.character(max(alle_tage)))
+  
+  output$zelle_aktiv  <- reactive({ !is.null(aktive_zelle()) })
+  output$detail_aktiv <- reactive({ detail_aktiv() })
+  outputOptions(output, "zelle_aktiv",  suspendWhenHidden = FALSE)
+  outputOptions(output, "detail_aktiv", suspendWhenHidden = FALSE)
+  
+  output$kennzahl_1min <- renderText({
+    kz <- kennzahlen %>% filter(anbieter == input$anbieter, stunde == input$stunde)
+    if (nrow(kz) == 0) return("–")
+    paste0(kz$anteil_1min, "%")
+  })
+  
+  output$kennzahl_2min <- renderText({
+    kz <- kennzahlen %>% filter(anbieter == input$anbieter, stunde == input$stunde)
+    if (nrow(kz) == 0) return("–")
+    paste0(kz$anteil_2min, "%")
+  })
+  
+  output$kennzahl_5min <- renderText({
+    kz <- kennzahlen %>% filter(anbieter == input$anbieter, stunde == input$stunde)
+    if (nrow(kz) == 0) return("–")
+    paste0(kz$anteil_5min, "%")
+  })
+  
+  output$karte <- renderLeaflet({
+    leaflet() %>%
+      addProviderTiles(providers$CartoDB.Positron) %>%
+      setView(lng = 4.3517, lat = 50.8503, zoom = 12)
+  })
+  
+  karten_daten <- reactive({
+    cache_key <- paste0(input$anbieter, "_", input$stunde)
+    geo_cache[[cache_key]]
+  })
+  
+  observe({
+    if (!is.null(aktive_zelle())) return()
+    daten <- karten_daten()
+    if (is.null(daten)) return()
+    
+    leafletProxy("karte") %>%
+      clearShapes() %>%
+      clearMarkers() %>%
+      clearControls() %>%
+      clearPopups() %>%
+      addPolygons(
+        data        = daten,
+        fillColor   = ~farbe,
+        fillOpacity = 0.75,
+        color       = ~farbe,
+        weight      = 0.3,
+        layerId     = ~from_id,
+        label       = ~tooltip
+      )
+  })
+  
+  zeige_fahrzeuge <- function(tag) {
+    zelle_id <- aktive_zelle()
+    if (is.null(zelle_id)) return()
+    
+    zentroid <- raster_zentroide %>% filter(from_id == zelle_id)
+    if (nrow(zentroid) == 0) return()
+    
+    lat_z <- zentroid$lat_z
+    lon_z <- zentroid$lon_z
+    
+    anbieter_filter <- input$anbieter
+    nahes <- fahrzeuge %>%
+      filter(datum == tag, stunde == input$stunde) %>%
+      mutate(dist = sqrt((lon - lon_z)^2 + (lat - lat_z)^2)) %>%
+      filter(dist <= radius_grad) %>%
+      filter(
+        anbieter_filter == "Kombiniert" |
+          (anbieter_filter == "Villo (cyclocity/JCDecaux)" & anbieter == "Villo") |
+          (anbieter_filter == "Dott"  & anbieter == "Dott") |
+          (anbieter_filter == "Bolt"  & anbieter == "Bolt")
+      )
+    
+    daten     <- karten_daten()
+    zelle_geo <- daten[daten$from_id == zelle_id, ]
+    
+    proxy <- leafletProxy("karte") %>%
+      clearMarkers() %>%
+      clearControls()
+    
+    if (length(zelle_geo) > 0) {
+      proxy <- proxy %>%
+        addPolygons(
+          data        = zelle_geo,
+          fillColor   = "#2196F3",
+          fillOpacity = 0.3,
+          color       = "#2196F3",
+          weight      = 2,
+          layerId     = "aktive_zelle"
+        )
+    }
+    
+    proxy <- proxy %>%
+      addCircles(
+        lng       = lon_z,
+        lat       = lat_z,
+        radius    = 400,
+        color     = "#2196F3",
+        weight    = 1.5,
+        opacity   = 0.8,
+        fill      = FALSE,
+        dashArray = "6, 6",
+        layerId   = "radius_kreis"
+      )
+    
+    if (nrow(nahes) > 0) {
+      proxy <- proxy %>%
+        addCircleMarkers(
+          data        = nahes,
+          lng         = ~lon,
+          lat         = ~lat,
+          radius      = 5,
+          color       = ~case_when(
+            anbieter == "Villo" ~ "#F5C800",
+            anbieter == "Dott"  ~ "#00C2E8",
+            TRUE                ~ "#34D186"
+          ),
+          fillColor   = ~case_when(
+            anbieter == "Villo" ~ "#F5C800",
+            anbieter == "Dott"  ~ "#00C2E8",
+            TRUE                ~ "#34D186"
+          ),
+          fillOpacity = 0.8,
+          weight      = 1,
+          label       = ~anbieter
+        )
+    }
+    
+    proxy %>%
+      addControl(
+        html = paste0(
+          "<b>", format(as.Date(tag), "%d.%m.%Y"),
+          " | ", input$stunde, ":00 Uhr</b><br>",
+          nrow(nahes), " Mieträder im 400m-Radius"
+        ),
+        position = "topright"
+      )
+  }
+  
+  observeEvent(input$karte_shape_click, {
+    klick        <- input$karte_shape_click
+    geklickte_id <- klick$id
+    if (is.null(geklickte_id)) return()
+    
+    aktive_zelle(geklickte_id)
+    
+    zelle_daten <- ergebnisse %>%
+      filter(from_id == geklickte_id, stunde == input$stunde) %>%
+      mutate(
+        datum    = as.Date(datum),
+        anbieter = recode(anbieter,
+                          "Villo (cyclocity/JCDecaux)" = "Villo"),
+        anbieter = factor(anbieter, levels = c("Villo", "Dott", "Bolt"))
+      )
+    
+    tmp         <- tempfile(fileext = ".png")
+    villo_fehlt <- !"Villo" %in% zelle_daten$anbieter
+    
+    farben_plot <- if (villo_fehlt) {
+      c("Villo: > 15 Min" = "#F5C800", "Dott" = "#00C2E8", "Bolt" = "#34D186")
+    } else {
+      anbieter_farben
+    }
+    
+    if (villo_fehlt) {
+      dummy <- tibble(datum = as.Date(NA), min_gehzeit = NA_real_,
+                      anbieter = factor("Villo: > 15 Min"))
+      zelle_daten <- bind_rows(zelle_daten, dummy)
+    }
+    
+    p <- ggplot(
+      zelle_daten %>% filter(!is.na(min_gehzeit)),
+      aes(x = datum, y = min_gehzeit, color = anbieter)
+    ) +
+      geom_line(linewidth = 0.8) +
+      geom_point(size = 1.5) +
+      scale_color_manual(values = farben_plot, breaks = names(farben_plot)) +
+      scale_y_continuous(limits = c(0, NA)) +
+      labs(
+        title = paste0("Gehzeit zum nächsten Mietrad um ",
+                       input$stunde, ":00 Uhr"),
+        x = NULL, y = "Gehzeit (Min)", color = NULL
+      ) +
+      theme_minimal(base_size = 10) +
+      theme(
+        legend.position  = "bottom",
+        plot.title       = element_text(size = 10, face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+    
+    ggsave(tmp, plot = p, width = 3.5, height = 2.2, dpi = 150)
+    img_base64 <- base64encode(tmp)
+    
+    popup_html <- paste0(
+      '<div style="text-align:center;">',
+      '<img src="data:image/png;base64,', img_base64,
+      '" width="320" height="200"/><br>',
+      '<button onclick="Shiny.setInputValue(\'tagesansicht_btn\', Math.random())" ',
+      'style="margin-top:8px; padding:5px 14px; background:white; color:#555; ',
+      'border:1px solid #ccc; border-radius:4px; cursor:pointer; font-size:12px;">',
+      'Tagesansicht öffnen</button>',
+      '<p style="font-size:11px; color:#999; margin:4px 0 0 0;">',
+      'Zeigt verfügbare Mieträder in der Nähe</p>',
+      '</div>'
+    )
+    
+    leafletProxy("karte") %>%
+      clearPopups() %>%
+      addPopups(
+        lng     = klick$lng,
+        lat     = klick$lat,
+        popup   = popup_html,
+        options = popupOptions(maxWidth = 360)
+      )
+  })
+  
+  observeEvent(input$tagesansicht_btn, {
+    zelle_id <- aktive_zelle()
+    if (is.null(zelle_id)) return()
+    
+    zentroid <- raster_zentroide %>% filter(from_id == zelle_id)
+    if (nrow(zentroid) == 0) return()
+    
+    detail_aktiv(TRUE)
+    
+    leafletProxy("karte") %>%
+      clearShapes() %>%
+      clearPopups() %>%
+      setView(lng = zentroid$lon_z, lat = zentroid$lat_z, zoom = 16)
+    
+    zeige_fahrzeuge(datum_aktiv())
+  })
+  
+  observeEvent(input$datum_gewaehlt, {
+    if (!detail_aktiv()) return()
+    datum_aktiv(input$datum_gewaehlt)
+    zeige_fahrzeuge(input$datum_gewaehlt)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$stunde, {
+    if (!detail_aktiv()) return()
+    zeige_fahrzeuge(datum_aktiv())
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$anbieter, {
+    if (!detail_aktiv()) return()
+    zeige_fahrzeuge(datum_aktiv())
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$play_btn, {
+    play_index(1)
+    play_aktiv(TRUE)
+  })
+  
+  observeEvent(input$stop_btn, {
+    play_aktiv(FALSE)
+  })
+  
+  observe({
+    if (!play_aktiv()) return()
+    invalidateLater(1000, session)
+    
+    idx <- isolate(play_index())
+    if (idx > length(alle_tage)) {
+      play_aktiv(FALSE)
+      return()
+    }
+    
+    tag <- as.character(alle_tage[idx])
+    datum_aktiv(tag)
+    updateSelectInput(session, "datum_gewaehlt", selected = tag)
+    zeige_fahrzeuge(tag)
+    play_index(idx + 1)
+  })
+  
+  observeEvent(input$zurueck, {
+    aktive_zelle(NULL)
+    detail_aktiv(FALSE)
+    play_aktiv(FALSE)
+    leafletProxy("karte") %>%
+      clearControls() %>%
+      clearPopups() %>%
+      setView(lng = 4.3517, lat = 50.8503, zoom = 12)
+  })
+}
+
+shinyApp(ui = ui, server = server)
+
+================================================================================
+DATEI: ./brussels_gbfs_logger.R
+================================================================================
+
+# =============================================================================
+# Brussels Multi-Provider GBFS Logger
+# Erfasst die verfuegbaren Fahrzeuge (Raeder/Scooter) fuer ALLE bekannten
+# Bikeshare-/Sharing-Anbieter in Bruessel mit oeffentlichem GBFS-Feed:
+#   - Villo (cyclocity/JCDecaux)   -> stationsbasiert
+#   - Dott Brussels                -> free-floating (keine Stationen)
+#   - Bolt Brussels                -> free-floating (keine Stationen)
+#
+# Hinweis: Lime und Voi bieten in Bruessel KEINEN oeffentlich zugaenglichen
+# GBFS-Feed an (nur auf Anfrage/Lizenz ueber transportdata.be). Sie sind
+# deshalb hier nicht enthalten. Seit Februar 2024 sind ohnehin nur Bolt und
+# Dott als Free-Floating-Anbieter in Bruessel zugelassen.
+#
+# =============================================================================
+
+required_packages <- c("jsonlite", "dplyr", "purrr", "httr", "tibble")
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(httr)
+library(tibble)
+
+# -----------------------------------------------------------------------------
+# 0. Zeitfenster-Check: nur zwischen 06:00 und 10:00 Uhr Bruesseler Zeit loggen
+#    Der Workflow wird extern alle 15 Minuten rund um die Uhr von cron-job.org
+#    ausgeloest (workflow_dispatch hat selbst keinen Zeitplan). Damit trotzdem
+#    nur in der gewuenschten Zeitspanne tatsaechlich geloggt wird, prueft das
+#    Skript bei jedem Aufruf zuerst die aktuelle Uhrzeit in Bruessel (CET/CEST,
+#    inkl. automatischer Sommerzeit-Umstellung) und beendet sich sofort, falls
+#    wir uns ausserhalb von 06:00-10:00 Uhr befinden.
+# -----------------------------------------------------------------------------
+bruessel_zeit <- Sys.time()
+attr(bruessel_zeit, "tzone") <- "Europe/Brussels"
+stunde_bruessel <- as.integer(format(bruessel_zeit, "%H"))
+
+if (stunde_bruessel < 6 || stunde_bruessel >= 10) {
+  message(sprintf(
+    "Ausserhalb des Logging-Fensters (06:00-10:00 Bruesseler Zeit). Aktuelle Zeit: %s. Beende ohne Aktion.",
+    format(bruessel_zeit, "%Y-%m-%d %H:%M:%S %Z")
+  ))
+  quit(save = "no", status = 0)
+}
+
+message(sprintf("Innerhalb des Logging-Fensters - aktuelle Bruesseler Zeit: %s",
+                 format(bruessel_zeit, "%Y-%m-%d %H:%M:%S %Z")))
+
+client_id <- "bikeshare-research-script-mac"
+
+gbfs_get <- function(url) {
+  res <- GET(
+    url,
+    add_headers(
+      `Client-Identifier` = client_id,
+      `User-Agent` = "Mozilla/5.0 (Bikeshare-Research-Script)"
+    )
+  )
+  fromJSON(content(res, as = "text", encoding = "UTF-8"))
+}
+
+# -----------------------------------------------------------------------------
+# 1. Konfiguration: alle Systeme in Bruessel mit oeffentlichem GBFS-Feed
+#    typ = "station"       -> hat station_information/station_status
+#    typ = "free_floating" -> hat nur vehicle_status / free_bike_status
+# -----------------------------------------------------------------------------
+
+systeme <- tibble::tibble(
+  land = c("BE", "BE", "BE"),
+  stadt = c("Bruessel", "Bruessel", "Bruessel"),
+  anbieter = c("Villo (cyclocity/JCDecaux)", "Dott", "Bolt"),
+  typ = c("station", "free_floating", "free_floating"),
+  gbfs_url = c(
+    "https://api.cyclocity.fr/contracts/bruxelles/gbfs/v3/gbfs.json",
+    "https://gbfs.api.ridedott.com/public/v2/brussels/gbfs.json",
+    "https://mds.bolt.eu/gbfs/3/336/gbfs"
+  )
+)
+
+# -----------------------------------------------------------------------------
+# 2. Hilfsfunktion: aus der Auto-Discovery-Datei die richtigen Feed-URLs holen
+# -----------------------------------------------------------------------------
+get_feed_urls <- function(gbfs_url) {
+  disc <- gbfs_get(gbfs_url)
+
+  feeds_df <- NULL
+  if (!is.null(disc$data$feeds)) {
+    feeds_df <- disc$data$feeds
+  } else {
+    erste_sprache <- disc$data[[1]]
+    feeds_df <- erste_sprache$feeds
+  }
+
+  hole_url <- function(name) {
+    treffer <- feeds_df$url[feeds_df$name == name]
+    if (length(treffer) == 0) NA_character_ else treffer[1]
+  }
+
+  list(
+    info_url        = hole_url("station_information"),
+    status_url      = hole_url("station_status"),
+    vehicle_url     = hole_url("vehicle_status"),
+    free_bike_url   = hole_url("free_bike_status")
+  )
+}
+
+# Hilfsfunktion: mehrsprachige GBFS-v3-Textfelder ({language, text}-Paare)
+# auf einen einzelnen String normalisieren.
+normalisiere_text <- function(x) {
+  vapply(x, function(e) {
+    if (is.data.frame(e) && "text" %in% names(e)) {
+      if (nrow(e) == 0) return(NA_character_)
+      as.character(e$text[1])
+    } else if (is.list(e) && !is.null(e$text)) {
+      as.character(e$text[1])
+    } else if (is.list(e)) {
+      werte <- unlist(e)
+      if (length(werte) == 0) return(NA_character_)
+      as.character(werte[1])
+    } else {
+      as.character(e)
+    }
+  }, character(1))
+}
+
+# -----------------------------------------------------------------------------
+# 3a. Stationsbasiertes System abfragen (z.B. Villo)
+# -----------------------------------------------------------------------------
+log_station_system <- function(land, stadt, anbieter, urls, zeitstempel) {
+  info   <- gbfs_get(urls$info_url)$data$stations
+  status <- gbfs_get(urls$status_url)$data$stations
+
+  info_df <- info %>%
+    select(station_id, name, lat, lon, any_of("capacity")) %>%
+    mutate(name = normalisiere_text(name))
+
+  status_df <- status %>%
+    select(station_id, any_of(c("num_bikes_available", "num_vehicles_available")), any_of("num_docks_available"))
+
+  if ("num_vehicles_available" %in% names(status_df) && !("num_bikes_available" %in% names(status_df))) {
+    status_df <- status_df %>% rename(num_bikes_available = num_vehicles_available)
+  }
+  status_df <- status_df %>% select(-any_of("num_vehicles_available"))
+
+  info_df %>%
+    inner_join(status_df, by = "station_id") %>%
+    mutate(land = land, stadt = stadt, anbieter = anbieter, timestamp = zeitstempel)
+}
+
+# -----------------------------------------------------------------------------
+# 3b. Free-Floating-System abfragen (z.B. Dott, Bolt)
+#     Es gibt keine Stationen - wir loggen jedes verfuegbare Fahrzeug als
+#     eigene "Station" mit seiner aktuellen Position, damit das Datenformat
+#     mit dem stationsbasierten Fall vergleichbar bleibt (eine Zeile pro
+#     verfuegbarem Fahrzeug/Standort und Zeitpunkt).
+# -----------------------------------------------------------------------------
+log_free_floating_system <- function(land, stadt, anbieter, urls, zeitstempel) {
+  vehicle_url <- if (!is.na(urls$vehicle_url)) urls$vehicle_url else urls$free_bike_url
+  if (is.na(vehicle_url)) stop("Kein vehicle_status/free_bike_status-Feed gefunden")
+
+  raw <- gbfs_get(vehicle_url)
+  fahrzeuge <- raw$data$vehicles
+  if (is.null(fahrzeuge)) fahrzeuge <- raw$data$bikes  # GBFS v2-Name als Fallback
+
+  if (is.null(fahrzeuge) || nrow(fahrzeuge) == 0) {
+    return(tibble(
+      station_id = NA_character_, name = anbieter, lat = NA_real_, lon = NA_real_,
+      capacity = NA_real_, num_bikes_available = 0L,
+      land = land, stadt = stadt, anbieter = anbieter, timestamp = zeitstempel
+    ))
+  }
+
+  id_spalte <- if ("vehicle_id" %in% names(fahrzeuge)) "vehicle_id" else "bike_id"
+
+  fahrzeuge %>%
+    transmute(
+      station_id = .data[[id_spalte]],
+      name = anbieter,
+      lat = lat,
+      lon = lon,
+      capacity = NA_real_,
+      num_bikes_available = 1L
+    ) %>%
+    mutate(land = land, stadt = stadt, anbieter = anbieter, timestamp = zeitstempel)
+}
+
+# -----------------------------------------------------------------------------
+# 4. Dispatcher: ein einzelnes System abfragen (je nach Typ)
+# -----------------------------------------------------------------------------
+log_system <- function(land, stadt, anbieter, typ, gbfs_url, zeitstempel) {
+  tryCatch({
+    urls <- get_feed_urls(gbfs_url)
+
+    ergebnis <- if (typ == "station") {
+      log_station_system(land, stadt, anbieter, urls, zeitstempel)
+    } else {
+      log_free_floating_system(land, stadt, anbieter, urls, zeitstempel)
+    }
+
+    message(sprintf("OK: %s (%s) - %d Zeilen", stadt, anbieter, nrow(ergebnis)))
+    return(ergebnis)
+
+  }, error = function(e) {
+    message(sprintf("FEHLER bei %s (%s): %s", stadt, anbieter, conditionMessage(e)))
+    return(NULL)
+  })
+}
+
+# -----------------------------------------------------------------------------
+# 5. Alle Systeme durchlaufen und Ergebnisse sammeln
+# -----------------------------------------------------------------------------
+zeitstempel <- format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = "UTC")
+
+alle_ergebnisse <- pmap(
+  list(systeme$land, systeme$stadt, systeme$anbieter, systeme$typ, systeme$gbfs_url),
+  function(land, stadt, anbieter, typ, gbfs_url) {
+    log_system(land, stadt, anbieter, typ, gbfs_url, zeitstempel)
+  }
+)
+
+gesamt_df <- bind_rows(alle_ergebnisse)
+
+# -----------------------------------------------------------------------------
+# 6. An CSV-Datei anhaengen (Header nur beim ersten Mal, taegliche Aufteilung).
+#    Es wird eine neue Datei pro Tag (UTC) erzeugt, z.B.
+#    "bikeshare_log_bruessel_2026-06-26.csv".
+# -----------------------------------------------------------------------------
+tagesstempel <- format(Sys.time(), "%Y-%m-%d", tz = "UTC")
+ausgabe_datei <- sprintf("bikeshare_log_bruessel_%s.csv", tagesstempel)
+
+if (nrow(gesamt_df) > 0) {
+  write.table(
+    gesamt_df,
+    file = ausgabe_datei,
+    sep = ",",
+    row.names = FALSE,
+    col.names = !file.exists(ausgabe_datei),
+    append = file.exists(ausgabe_datei),
+    qmethod = "double"
+  )
+  message(sprintf("\n%d Zeilen geschrieben nach %s (Stand: %s UTC)",
+                   nrow(gesamt_df), ausgabe_datei, zeitstempel))
+} else {
+  message("Keine Daten erhalten - nichts geschrieben.")
+}
+
+# -----------------------------------------------------------------------------
+# 7. Test-/Plausibilitaets-Zusammenfassung
+# -----------------------------------------------------------------------------
+zusammenfassung <- systeme %>%
+  select(land, stadt, anbieter) %>%
+  left_join(
+    gesamt_df %>%
+      group_by(land, stadt, anbieter) %>%
+      summarise(
+        zeilen = n(),
+        fahrzeuge_gesamt = sum(num_bikes_available, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = c("land", "stadt", "anbieter")
+  ) %>%
+  mutate(
+    status = ifelse(is.na(zeilen), "FEHLER", "OK"),
+    zeilen = ifelse(is.na(zeilen), 0, zeilen),
+    fahrzeuge_gesamt = ifelse(is.na(fahrzeuge_gesamt), 0, fahrzeuge_gesamt)
+  )
+
+message("\n===================== ZUSAMMENFASSUNG (BRUESSEL) =====================")
+print(as.data.frame(zusammenfassung), row.names = FALSE)
+message("========================================================================")
+message(sprintf(
+  "Erfolgreich: %d von %d Anbietern | Fahrzeuge gesamt: %d",
+  sum(zusammenfassung$status == "OK"),
+  nrow(zusammenfassung),
+  sum(zusammenfassung$fahrzeuge_gesamt)
+))
+
+
+================================================================================
+DATEI: ./r5r Berechnung.R
+================================================================================
+
+options(java.parameters = "-Xmx6G")
+library(r5r)
+library(sf)
+library(dplyr)
+library(lubridate)
+library(readr)
+
+# -----------------------------------------------------------------------------
+# Daten laden
+# -----------------------------------------------------------------------------
+r5r_core <- setup_r5(data_path = ".")
+
+raster_punkte <- st_read("raster_bruessel_100m.gpkg", quiet = TRUE) %>%
+  st_transform(crs = 4326) %>%
+  st_centroid() %>%
+  mutate(
+    id  = as.character(row_number()),
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(id, lon, lat, ms_pop)
+
+schnappschuesse <- read_csv("analyse_schnappschuesse.csv",
+                            show_col_types = FALSE)
+
+message("Alles geladen")
+
+# -----------------------------------------------------------------------------
+# Analyse: pro Anbieter, pro Zeitpunkt, pro Tag
+# Ergebnisse sofort wegschreiben — nie alles im RAM halten
+# -----------------------------------------------------------------------------
+anbieter_liste <- unique(schnappschuesse$anbieter)
+zeitpunkte     <- c(6, 7, 8, 9)
+tage           <- sort(unique(schnappschuesse$datum))
+
+# Ausgabedatei zurücksetzen
+if (file.exists("ergebnisse_gehzeiten.csv")) {
+  file.remove("ergebnisse_gehzeiten.csv")
+}
+
+for (anbieter in anbieter_liste) {
+  for (stunde in zeitpunkte) {
+    for (tag in tage) {
+      
+      tag_datum <- as.Date(tag, origin = "1970-01-01")
+      
+      # Ziele für diesen Anbieter / Zeitpunkt / Tag
+      ziele <- schnappschuesse %>%
+        filter(
+          anbieter == !!anbieter,
+          stunde   == !!stunde,
+          datum    == !!tag_datum
+        ) %>%
+        mutate(id = as.character(row_number())) %>%
+        select(id, lon, lat)
+      
+      if (nrow(ziele) == 0) {
+        message(sprintf("LEER: %s | %dh | %s", anbieter, stunde, tag_datum))
+        next
+      }
+      
+      # Departure datetime: Tag + Stunde in UTC
+      # (Brüsseler Zeit CEST = UTC+2, also 6h Brüssel = 4h UTC)
+      abfahrt <- as.POSIXct(
+        sprintf("%s %02d:00:00", tag_datum, stunde - 2),
+        tz = "UTC"
+      )
+      
+      # Gehzeit-Matrix berechnen
+      ttm <- travel_time_matrix(
+        r5r_core           = r5r_core,
+        origins            = raster_punkte %>% select(id, lon, lat),
+        destinations       = ziele,
+        mode               = "WALK",
+        max_walk_time      = 15,
+        time_window        = 1,
+        departure_datetime = abfahrt
+      )
+      
+      # Kürzeste Gehzeit pro Rasterzelle
+      ergebnis <- ttm %>%
+        group_by(from_id) %>%
+        summarise(min_gehzeit = min(travel_time_p50, na.rm = TRUE),
+                  .groups = "drop") %>%
+        mutate(
+          anbieter = anbieter,
+          stunde   = stunde,
+          datum    = as.character(tag_datum)
+        )
+      
+      # Sofort wegschreiben
+      write_csv(
+        ergebnis,
+        "ergebnisse_gehzeiten.csv",
+        append = file.exists("ergebnisse_gehzeiten.csv")
+      )
+      
+      rm(ttm, ergebnis, ziele)
+      gc()
+      
+      message(sprintf("OK: %s | %dh | %s", anbieter, stunde, tag_datum))
+    }
+  }
+}
+
+message("\nAnalyse abgeschlossen — ergebnisse_gehzeiten.csv erstellt")
+
+ergebnisse <- read_csv("ergebnisse_gehzeiten.csv", 
+                       show_col_types = FALSE)
+
+# Vollständigkeit prüfen
+ergebnisse %>%
+  group_by(anbieter, stunde) %>%
+  summarise(tage = n_distinct(datum), .groups = "drop") %>%
+  arrange(anbieter, stunde)
+
+warnings()
+
+
